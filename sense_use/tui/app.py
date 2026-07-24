@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -24,6 +26,25 @@ from sense_use.tui.widgets.memory_tree import MemoryTree
 from sense_use.tui.widgets.voice_input import VoiceCapture
 
 
+def _read_clipboard() -> str | None:
+    """Return system clipboard text, or None if no reader is available."""
+    if sys.platform == "darwin":
+        cmd = ["pbpaste"]
+    elif sys.platform.startswith("linux"):
+        cmd = ["xclip", "-selection", "clipboard", "-o"]
+    elif sys.platform.startswith("win"):
+        cmd = ["powershell", "-NoProfile", "-Command", "Get-Clipboard"]
+    else:
+        return None
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=3)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", errors="replace")
+
+
 class SenseUseApp(App):
     CSS = """
     Screen { layout: vertical; }
@@ -38,6 +59,7 @@ class SenseUseApp(App):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+s", "archive", "📁 Archive"),
         Binding("ctrl+space", "voice_toggle", "🎙 Voice"),
+        Binding("ctrl+shift+v", "paste_clipboard", "📋 Paste"),
         Binding("y", "confirm_yes", "✅ Yes", show=False),
         Binding("n", "confirm_no", "❌ No", show=False),
     ]
@@ -179,6 +201,28 @@ class SenseUseApp(App):
     async def action_confirm_no(self) -> None:
         if self._confirm_active and self.runner:
             await self.runner.resolve_confirm(False)
+
+    async def action_paste_clipboard(self) -> None:
+        """Read system clipboard and append into the Input widget.
+
+        Textual's Input already handles Cmd+V / Ctrl+V for single-line paste, but
+        many terminals intercept those. This gives us a first-class Ctrl+Shift+V
+        that also flattens multi-line clipboard content to spaces.
+        """
+        log = self.query_one("#log", RichLog)
+        inp = self.query_one("#input", Input)
+        text = await asyncio.to_thread(_read_clipboard)
+        if text is None:
+            log.write(Text.from_markup(
+                "[red]📋 clipboard read failed — install `pbpaste` (macOS) / `xclip` (Linux)[/red]"
+            ))
+            return
+        if not text:
+            log.write("[dim]📋 clipboard is empty[/dim]")
+            return
+        flat = " ".join(text.splitlines())
+        inp.value = inp.value + flat
+        inp.cursor_position = len(inp.value)
 
     def _push_confirm(self, action: str, label: str, args: dict) -> None:
         async def _resolve(ok: bool | None) -> None:
