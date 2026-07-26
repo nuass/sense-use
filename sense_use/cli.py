@@ -37,6 +37,18 @@ def _root(
         "-c",
         help="Path to config.yaml (default: ~/.sense-use/config.yaml).",
     ),
+    targets: str = typer.Option(
+        "browser",
+        "--targets",
+        "-t",
+        help=(
+            "Comma-separated panes. Syntax: kind[@endpoint]. "
+            "Kinds: browser, adb, desktop, vnc. "
+            "Examples: --targets browser,adb,desktop  ·  "
+            "--targets browser@9222,browser@9223  ·  "
+            "--targets adb@SERIAL1,adb@SERIAL2"
+        ),
+    ),
 ) -> None:
     """Launch the TUI when no subcommand is given."""
     if ctx.invoked_subcommand is not None:
@@ -48,7 +60,13 @@ def _root(
 
     effective_provider = provider or cfg.default_provider
     effective_cdp = cdp_url or cfg.cdp_url
-    run_tui(cdp_url=effective_cdp, provider_key=effective_provider, config=cfg)
+    target_list = [t.strip() for t in targets.split(",") if t.strip()] or ["browser"]
+    run_tui(
+        cdp_url=effective_cdp,
+        provider_key=effective_provider,
+        config=cfg,
+        targets=target_list,
+    )
 
 
 @app.command("config-path")

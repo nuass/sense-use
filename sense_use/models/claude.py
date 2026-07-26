@@ -32,11 +32,22 @@ class ClaudeProvider(ModelProvider):
         if AsyncAnthropic is None:
             raise RuntimeError("Claude provider needs `pip install anthropic`")
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("Claude provider needs ANTHROPIC_API_KEY")
-        self.model = model
+        self.auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        self.base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if not self.api_key and not self.auth_token:
+            raise RuntimeError(
+                "Claude provider needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"
+            )
+        self.model = os.environ.get("ANTHROPIC_MODEL") or model
         self.max_tokens = max_tokens
-        self._client = AsyncAnthropic(api_key=self.api_key)
+        client_kwargs: dict = {}
+        if self.api_key:
+            client_kwargs["api_key"] = self.api_key
+        if self.auth_token:
+            client_kwargs["auth_token"] = self.auth_token
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        self._client = AsyncAnthropic(**client_kwargs)
 
     async def decide(
         self,

@@ -41,6 +41,18 @@ Action args:
 - done:  {"answer": string}   set done=true when the goal is achieved
 
 Coordinates are in the screenshot's pixel space. Take small, verifiable steps.
+
+CRITICAL JSON rules — violate any and the run fails:
+1. Emit exactly ONE JSON object. No markdown fences, no prose before or after.
+2. Inside string values, NEVER include a raw double-quote (") — if you must quote
+   something the user said, use 「」 or single quotes '...' or backticks `...`.
+3. `args.text` MUST contain the FULL text the user wanted, verbatim. Do not
+   truncate at punctuation, quotes, or commas.
+4. After a `type` action for a search box, the next step should usually be
+   `key` with {"name": "enter"} unless you have another reason.
+5. Every action's args MUST include ALL required keys — click needs BOTH x and y
+   integers (never x alone), swipe needs x1/y1/x2/y2, key needs name, goto needs
+   url. Missing keys fail the step silently.
 """
 
 
@@ -116,7 +128,6 @@ def _parse_decision(text: str) -> ModelDecision:
     """Extract the JSON object from the model response, tolerating code fences."""
     stripped = text.strip()
     if stripped.startswith("```"):
-        # Drop opening fence line and trailing fence.
         stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped
         if stripped.endswith("```"):
             stripped = stripped[: -3]
@@ -124,13 +135,37 @@ def _parse_decision(text: str) -> ModelDecision:
         if stripped.startswith("json"):
             stripped = stripped[4:].strip()
 
-    # Find first '{' .. matching '}'.
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start < 0 or end < 0:
         raise ValueError(f"model reply is not JSON:\n{text}")
+    raw = stripped[start : end + 1]
 
-    obj: dict[str, Any] = json.loads(stripped[start : end + 1])
+    try:
+        obj: dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError:
+        # Model often embeds Chinese full-width quotes (" " ' ') inside string
+        # values, which are legal Unicode but confuse json.loads when they mix
+        # with straight quotes. Normalize to safe replacements and retry.
+        repaired = (
+            raw.replace("“", "「")
+            .replace("”", "」")
+            .replace("‘", "『")
+            .replace("’", "』")
+        )
+        try:
+            obj = json.loads(repaired)
+        except json.JSONDecodeError:
+            # Last resort: try json_repair if installed (opt-in).
+            try:
+                import json_repair  # type: ignore
+
+                obj = json_repair.loads(raw)  # type: ignore[assignment]
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"model reply is not valid JSON: {exc}\n---\n{text}"
+                ) from exc
+
     return ModelDecision(
         thought=str(obj.get("thought", "")),
         action=str(obj.get("action", "done")),

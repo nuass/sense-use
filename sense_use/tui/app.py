@@ -1,4 +1,8 @@
-"""Textual TUI — main app for M1 (single Browser session, no floating viewer yet)."""
+"""Textual TUI — multi-pane layout, one lane per Backend.
+
+Each pane owns its own Backend + TaskRunner + EventBus so browser / adb /
+desktop / vnc can run in parallel without stepping on each other.
+"""
 
 from __future__ import annotations
 
@@ -7,27 +11,26 @@ import subprocess
 import sys
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
-from sense_use.backends.browser_backend import BrowserBackend
 from sense_use.config import Config
-from sense_use.core.event_bus import Event, EventBus
-from sense_use.core.session import Session
-from sense_use.core.task_runner import TaskRunner
+from sense_use.core.event_bus import Event
 from sense_use.models import provider_registry
 from sense_use.store.session_store import SessionStore
 from sense_use.tui.screens.confirm_modal import ConfirmModal
 from sense_use.tui.screens.memory_modal import MemoryModal
 from sense_use.tui.screens.project_modal import ProjectModal
 from sense_use.tui.widgets.memory_tree import MemoryTree
+from sense_use.tui.widgets.target_pane import TargetPane
+from sense_use.tui.widgets.target_picker import TargetPicker
 from sense_use.tui.widgets.voice_input import VoiceCapture
 
 
 def _read_clipboard() -> str | None:
-    """Return system clipboard text, or None if no reader is available."""
     if sys.platform == "darwin":
         cmd = ["pbpaste"]
     elif sys.platform.startswith("linux"):
@@ -45,13 +48,118 @@ def _read_clipboard() -> str | None:
     return out.stdout.decode("utf-8", errors="replace")
 
 
+def _write_clipboard(text: str) -> bool:
+    if sys.platform == "darwin":
+        cmd = ["pbcopy"]
+    elif sys.platform.startswith("linux"):
+        cmd = ["xclip", "-selection", "clipboard"]
+    elif sys.platform.startswith("win"):
+        cmd = ["clip"]
+    else:
+        return False
+    try:
+        p = subprocess.run(cmd, input=text.encode("utf-8"), timeout=3)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+def _parse_target(spec: str, default_cdp: str) -> tuple[str, str, dict]:
+    """Parse one --targets entry.
+
+    Syntax: ``kind[@endpoint]`` — everything after the first ``@`` is
+    endpoint config, kind-specific:
+
+    - ``browser`` / ``browser@9223`` / ``browser@127.0.0.1:9223`` /
+      ``browser@http://host:9223``
+    - ``adb`` / ``adb@TWPVAEUWQ4QWNR9H`` (device serial)
+    - ``desktop`` / ``desktop@2`` (monitor index)
+    - ``vnc@10.0.0.5:5901`` / ``vnc@10.0.0.5:5901:mypassword``
+
+    Returns ``(kind, title, backend_kwargs)`` — title is user-facing, kwargs
+    are fed straight into the Backend constructor.
+    """
+    raw = spec.strip()
+    if "@" in raw:
+        kind, endpoint = raw.split("@", 1)
+    else:
+        kind, endpoint = raw, ""
+    kind = kind.strip().lower()
+    endpoint = endpoint.strip()
+
+    if kind in ("browser", "cdp", "chrome"):
+        cdp = _normalize_cdp(endpoint, default_cdp)
+        return "browser", f"browser @ {_short_cdp(cdp)}", {"cdp_url": cdp}
+
+    if kind in ("adb", "mobile", "android"):
+        serial = endpoint or None
+        title = f"adb @ {serial}" if serial else "adb (default device)"
+        return "adb", title, ({"serial": serial} if serial else {})
+
+    if kind in ("desktop", "mac", "local"):
+        monitor = int(endpoint) if endpoint.isdigit() else 1
+        title = f"desktop (mon {monitor})" if endpoint else "desktop (this mac)"
+        return "desktop", title, {"monitor": monitor}
+
+    if kind in ("vnc",):
+        # host[:port[:password]]
+        parts = endpoint.split(":", 2) if endpoint else []
+        import os
+        host = parts[0] if len(parts) >= 1 and parts[0] else os.environ.get("SENSE_USE_VNC_HOST", "127.0.0.1")
+        port = int(parts[1]) if len(parts) >= 2 and parts[1] else int(os.environ.get("SENSE_USE_VNC_PORT", "5900"))
+        password = parts[2] if len(parts) >= 3 else os.environ.get("SENSE_USE_VNC_PASS", "")
+        return "vnc", f"vnc @ {host}:{port}", {"host": host, "port": port, "password": password}
+
+    raise ValueError(f"unknown target kind: {kind}")
+
+
+def _normalize_cdp(endpoint: str, default: str) -> str:
+    """Turn ``9223`` / ``127.0.0.1:9223`` / full URL into a CDP URL."""
+    if not endpoint:
+        return default
+    if endpoint.startswith(("http://", "https://")):
+        return endpoint
+    if ":" in endpoint:
+        return f"http://{endpoint}"
+    if endpoint.isdigit():
+        return f"http://127.0.0.1:{endpoint}"
+    # bare hostname — default to :9222
+    return f"http://{endpoint}:9222"
+
+
+def _short_cdp(url: str) -> str:
+    # http://127.0.0.1:9222 -> 127.0.0.1:9222
+    return url.split("://", 1)[-1].rstrip("/")
+
+
+def _build_target_factory(kind: str, kwargs: dict):
+    """Return a zero-arg callable that builds the Backend for `kind`.
+
+    Deferred construction — dependencies (playwright, pyautogui, adb) may or
+    may not be installed; failures surface only when the user hits Enter in
+    that pane, not at TUI boot.
+    """
+    if kind == "browser":
+        from sense_use.backends.browser_backend import BrowserBackend
+        return lambda: BrowserBackend(**kwargs)
+    if kind == "adb":
+        from sense_use.backends.adb_backend import AdbBackend
+        return lambda: AdbBackend(**kwargs)
+    if kind == "desktop":
+        from sense_use.backends.desktop_backend import DesktopBackend
+        return lambda: DesktopBackend(**kwargs)
+    if kind == "vnc":
+        from sense_use.backends.vnc_backend import VncBackend
+        return lambda: VncBackend(**kwargs)
+    raise ValueError(f"unknown target kind: {kind}")
+
+
 class SenseUseApp(App):
     CSS = """
     Screen { layout: vertical; }
     #main { height: 1fr; }
-    #sidebar { width: 30; border-right: solid $primary; }
-    #chat { padding: 0 1; }
-    #input { dock: bottom; }
+    #sidebar { width: 26; border-right: solid $primary; }
+    #panes { layout: horizontal; height: 1fr; }
     RichLog { background: $surface; }
     """
 
@@ -60,6 +168,8 @@ class SenseUseApp(App):
         Binding("ctrl+s", "archive", "📁 Archive"),
         Binding("ctrl+space", "voice_toggle", "🎙 Voice"),
         Binding("ctrl+shift+v", "paste_clipboard", "📋 Paste"),
+        Binding("ctrl+shift+c", "copy_log", "📄 Copy log"),
+        Binding("ctrl+y", "copy_log", "📄 Copy", show=False),
         Binding("y", "confirm_yes", "✅ Yes", show=False),
         Binding("n", "confirm_no", "❌ No", show=False),
     ]
@@ -69,170 +179,216 @@ class SenseUseApp(App):
         cdp_url: str = "http://127.0.0.1:9222",
         provider_key: str = "volc",
         config: Config | None = None,
+        targets: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.cdp_url = cdp_url
         self.provider_key = provider_key
         self.config = config or Config()
-        self.bus = EventBus()
-        self.runner: TaskRunner | None = None
-        self._runner_task: asyncio.Task | None = None
-        self._sub: asyncio.Queue[Event] | None = None
-        self._session_store: SessionStore | None = None
-        self._confirm_active = False
+        # If user gave --targets, we skip the picker and attach right away.
+        # Otherwise start with an empty panes area and let the sidebar picker
+        # populate it interactively.
+        self.targets = targets or []
+        self._auto_attach = bool(targets)
+        self.panes: dict[str, TargetPane] = {}  # pane_id -> pane
+        self._provider = None
         self._voice: VoiceCapture | None = None
         self._voice_task: asyncio.Task | None = None
         self._voice_baseline: str = ""
+        self._log_dump_path = "/tmp/sense-use-last.log"
+        self._pending_confirm_pane: TargetPane | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main"):
             with Vertical(id="sidebar"):
-                yield Static("[b]Targets[/b]\n\n• browser @ 9222\n\n[dim]Ctrl+S archive · Ctrl+Space voice[/dim]", id="targets")
+                if self._auto_attach:
+                    targets_line = " · ".join(self.targets)
+                    yield Static(
+                        f"[b]Targets[/b]\n\n{targets_line}\n\n"
+                        "[dim]Tab to switch pane · Ctrl+S archive · Ctrl+Space voice[/dim]",
+                        id="targets", markup=True,
+                    )
+                else:
+                    yield TargetPicker(id="picker")
                 yield MemoryTree(id="memtree")
-            with Vertical(id="chat"):
-                yield RichLog(id="log", wrap=True, markup=True, highlight=True)
-        yield Input(placeholder="Type your task and press Enter (Y/N to confirm)...", id="input")
+            with Horizontal(id="panes"):
+                try:
+                    self._provider = self._build_provider()
+                except Exception as exc:  # noqa: BLE001
+                    self._provider = None
+                    self._provider_error = repr(exc)
+                if self._auto_attach:
+                    yield from self._spawn_panes(self.targets)
+                else:
+                    yield Static(
+                        "[dim]← pick targets in the sidebar, then press "
+                        "[b]Attach selected[/b][/dim]",
+                        id="empty-hint", markup=True,
+                    )
         yield Footer()
+
+    def _spawn_panes(self, specs: list[str]):
+        """Generator: yield TargetPane widgets for the given specs.
+
+        Used both at first render (with --targets) and lazily when the picker
+        emits TargetsChosen — the caller mount()s the yielded widgets.
+        """
+        for i, spec in enumerate(specs):
+            pane_id = f"pane-{len(self.panes) + i}"
+            try:
+                kind, title, kwargs = _parse_target(spec, self.cdp_url)
+                factory = _build_target_factory(kind, kwargs)
+            except ValueError as exc:
+                yield Static(f"[red]skip pane {spec!r}: {exc}[/red]")
+                continue
+            pane = TargetPane(
+                title=title,
+                backend_factory=factory,
+                provider=self._provider,  # type: ignore[arg-type]
+                on_confirm_needed=self._on_pane_confirm_needed,
+                pane_id=pane_id,
+            )
+            self.panes[pane_id] = pane
+            yield pane
+
+    async def on_target_picker_targets_chosen(
+        self, message: TargetPicker.TargetsChosen
+    ) -> None:
+        """User pressed 'Attach selected' — mount panes for the chosen specs."""
+        panes_container = self.query_one("#panes", Horizontal)
+        # Clear the empty-hint placeholder on first attach.
+        try:
+            self.query_one("#empty-hint", Static).remove()
+        except Exception:  # noqa: BLE001
+            pass
+        # Deduplicate against already-attached specs (metadata check on title).
+        existing_titles = {p.title for p in self.panes.values()}
+        for widget in self._spawn_panes(message.specs):
+            if isinstance(widget, TargetPane) and widget.title in existing_titles:
+                # already have this pane — skip
+                self.panes.pop(widget.id or "", None)
+                continue
+            await panes_container.mount(widget)
+
+    def _build_provider(self):
+        kwargs = self.config.provider_kwargs(self.provider_key)
+        return provider_registry.build(self.provider_key, **kwargs)
 
     def on_memory_tree_memory_selected(self, event: MemoryTree.MemorySelected) -> None:
         def _after(_: None) -> None:
-            # Reload sidebar in case hook/title changed via update_index_line
             self.query_one("#memtree", MemoryTree).refresh_entries()
-
         self.push_screen(MemoryModal(event.filename), _after)
 
     async def on_mount(self) -> None:
-        log = self.query_one("#log", RichLog)
-        log.write(Text.from_markup(
-            "[bold cyan]sense-use[/bold cyan] — Computer + Mobile + Browser Use.\n"
-            f"[dim]CDP: {self.cdp_url} · provider: {self.provider_key}[/dim]\n"
-            "Type a goal below (e.g. 'open arxiv.org and read top 3 titles for llm agents').\n"
-        ))
-        self._sub = self.bus.subscribe()
-        self.run_worker(self._pump_events(), exclusive=False)
+        # Panes render their own welcome via TargetPane on_mount.
+        pass
 
-    async def _pump_events(self) -> None:
-        log = self.query_one("#log", RichLog)
-        assert self._sub is not None
-        while True:
-            ev = await self._sub.get()
-            if self._session_store:
-                self._session_store.append(ev)
-            self._render_event(log, ev)
-
-    def _render_event(self, log: RichLog, ev: Event) -> None:
-        p = ev.payload
-        if ev.kind == "user_msg":
-            log.write(Text.from_markup(f"[bold]🧑 goal:[/bold] {p.get('goal','')}"))
-        elif ev.kind == "observe":
-            n = p.get("screenshot_bytes")
-            size = n if isinstance(n, int) else (len(n) if n else 0)
-            log.write(Text.from_markup(f"[dim]👁 step {p.get('step')} — screenshot {size} bytes[/dim]"))
-        elif ev.kind == "think":
-            log.write(Text.from_markup(
-                f"[yellow]🧠 step {p.get('step')}[/yellow] {p.get('thought','')}\n"
-                f"   [cyan]→ {p.get('action')} {p.get('args')}[/cyan]"
-            ))
-        elif ev.kind == "act_result":
-            ok = p.get("ok")
-            color = "green" if ok else "red"
-            log.write(Text.from_markup(
-                f"[{color}]✔ {p.get('action')} — {p.get('detail','')}[/{color}]"
-            ))
-        elif ev.kind == "confirm_needed":
-            self._confirm_active = True
-            log.write(Text.from_markup(
-                f"[bold magenta]⚠ CONFIRM[/bold magenta] {p.get('action')} on "
-                f"[u]{p.get('label','')}[/u] · press [b]Y[/b] to allow, [b]N[/b] to reject"
-            ))
-            self._push_confirm(p.get("action", ""), p.get("label", ""), p.get("args", {}))
-        elif ev.kind == "confirm_result":
-            self._confirm_active = False
-        elif ev.kind == "done":
-            log.write(Text.from_markup(f"[bold green]✅ DONE:[/bold green] {p.get('answer','')}"))
-        elif ev.kind == "error":
-            log.write(Text.from_markup(f"[bold red]✖ error:[/bold red] {p.get('reason','')}"))
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        goal = event.value.strip()
-        event.input.value = ""
-        if not goal:
+    async def on_paste(self, event: events.Paste) -> None:
+        """Flatten multi-line paste into the focused pane's input."""
+        text = event.text
+        if "\n" not in text and "\r" not in text:
             return
-        if self._runner_task and not self._runner_task.done():
-            self.query_one("#log", RichLog).write("[dim]⏳ agent busy — wait for it to finish[/dim]")
+        event.stop()
+        event.prevent_default()
+        flat = " ".join(text.replace("\r\n", "\n").replace("\r", "\n").splitlines()).strip()
+        inp = self._focused_input()
+        if inp is None:
             return
-        await self._start_run(goal)
+        inp.value = inp.value + flat
+        inp.cursor_position = len(inp.value)
 
-    async def _start_run(self, goal: str) -> None:
-        log = self.query_one("#log", RichLog)
-        backend = BrowserBackend(cdp_url=self.cdp_url)
-        try:
-            await backend.start()
-        except Exception as e:  # noqa: BLE001
-            log.write(Text.from_markup(f"[red]failed to connect CDP: {e}[/red]"))
-            return
-
-        try:
-            kwargs = self.config.provider_kwargs(self.provider_key)
-            provider = provider_registry.build(self.provider_key, **kwargs)
-        except (RuntimeError, KeyError) as e:
-            log.write(Text.from_markup(f"[red]{e}[/red]"))
-            await backend.stop()
-            return
-
-        session = Session(goal=goal)
-        self._session_store = SessionStore(session.id)
-        self.runner = TaskRunner(session=session, backend=backend, provider=provider, bus=self.bus)
-        log.write(Text.from_markup(f"[dim]session {session.id} started[/dim]"))
-
-        async def _go():
+    def _focused_input(self) -> Input | None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            return focused
+        # fall back to first pane's input
+        for pane in self.panes.values():
             try:
-                await self.runner.run()  # type: ignore[union-attr]
-            finally:
-                await backend.stop()
+                return pane.query_one("#pane-input", Input)
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
-        self._runner_task = asyncio.create_task(_go())
+    def _focused_pane(self) -> TargetPane | None:
+        """Which pane's Input currently has focus (for voice/paste routing)."""
+        node = self.focused
+        while node is not None:
+            if isinstance(node, TargetPane):
+                return node
+            node = node.parent  # type: ignore[assignment]
+        # fallback: first pane
+        return next(iter(self.panes.values()), None)
+
+    # ---- confirm routing ------------------------------------------------
+
+    def _on_pane_confirm_needed(
+        self, pane: TargetPane, action: str, label: str, args: dict
+    ) -> None:
+        self._pending_confirm_pane = pane
+
+        async def _resolve(ok: bool | None) -> None:
+            target = self._pending_confirm_pane
+            self._pending_confirm_pane = None
+            if target is not None:
+                await target.resolve_confirm(bool(ok))
+
+        self.push_screen(ConfirmModal(action, label, args), _resolve)
 
     async def action_confirm_yes(self) -> None:
-        if self._confirm_active and self.runner:
-            await self.runner.resolve_confirm(True)
+        # Fallback keyboard yes when modal isn't the active screen (rare).
+        pane = self._focused_pane()
+        if pane is not None and pane.confirm_active:
+            await pane.resolve_confirm(True)
 
     async def action_confirm_no(self) -> None:
-        if self._confirm_active and self.runner:
-            await self.runner.resolve_confirm(False)
+        pane = self._focused_pane()
+        if pane is not None and pane.confirm_active:
+            await pane.resolve_confirm(False)
+
+    # ---- clipboard ------------------------------------------------------
 
     async def action_paste_clipboard(self) -> None:
-        """Read system clipboard and append into the Input widget.
-
-        Textual's Input already handles Cmd+V / Ctrl+V for single-line paste, but
-        many terminals intercept those. This gives us a first-class Ctrl+Shift+V
-        that also flattens multi-line clipboard content to spaces.
-        """
-        log = self.query_one("#log", RichLog)
-        inp = self.query_one("#input", Input)
-        text = await asyncio.to_thread(_read_clipboard)
-        if text is None:
-            log.write(Text.from_markup(
-                "[red]📋 clipboard read failed — install `pbpaste` (macOS) / `xclip` (Linux)[/red]"
-            ))
+        inp = self._focused_input()
+        if inp is None:
             return
+        text = await asyncio.to_thread(_read_clipboard)
         if not text:
-            log.write("[dim]📋 clipboard is empty[/dim]")
             return
         flat = " ".join(text.splitlines())
         inp.value = inp.value + flat
         inp.cursor_position = len(inp.value)
 
-    def _push_confirm(self, action: str, label: str, args: dict) -> None:
-        async def _resolve(ok: bool | None) -> None:
-            if self.runner and self._confirm_active:
-                await self.runner.resolve_confirm(bool(ok))
-        self.push_screen(ConfirmModal(action, label, args), _resolve)
+    async def action_copy_log(self) -> None:
+        pane = self._focused_pane()
+        if pane is None:
+            return
+        blob = "\n".join(pane.log_buffer)
+        if not blob:
+            return
+        ok = await asyncio.to_thread(_write_clipboard, blob)
+        # Also dump to file so users have a fallback.
+        try:
+            with open(self._log_dump_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {pane.title} ===\n" + blob + "\n")
+        except OSError:
+            pass
+        log = pane.query_one("#pane-log", RichLog)
+        if ok:
+            log.write(Text.from_markup(f"[green]📄 copied {len(blob)} chars[/green]"))
+        else:
+            log.write(Text.from_markup(
+                f"[yellow]📄 clipboard write failed — see {self._log_dump_path}[/yellow]"
+            ))
+
+    # ---- voice ----------------------------------------------------------
 
     async def action_voice_toggle(self) -> None:
-        log = self.query_one("#log", RichLog)
-        inp = self.query_one("#input", Input)
+        pane = self._focused_pane()
+        if pane is None:
+            return
+        log = pane.query_one("#pane-log", RichLog)
+        inp = pane.query_one("#pane-input", Input)
         if self._voice is None:
             try:
                 self._voice = VoiceCapture()
@@ -242,8 +398,8 @@ class SenseUseApp(App):
                 self._voice = None
                 return
             self._voice_baseline = inp.value
-            log.write(Text.from_markup("[cyan]🎙 recording — press Ctrl+Space to stop[/cyan]"))
-            self._voice_task = asyncio.create_task(self._voice_pump())
+            log.write(Text.from_markup("[cyan]🎙 recording — Ctrl+Space to stop[/cyan]"))
+            self._voice_task = asyncio.create_task(self._voice_pump(pane))
         else:
             await self._voice.stop()
             self._voice = None
@@ -252,10 +408,10 @@ class SenseUseApp(App):
                 self._voice_task = None
             log.write(Text.from_markup("[dim]🎙 stopped[/dim]"))
 
-    async def _voice_pump(self) -> None:
+    async def _voice_pump(self, pane: TargetPane) -> None:
         assert self._voice is not None
-        inp = self.query_one("#input", Input)
-        log = self.query_one("#log", RichLog)
+        inp = pane.query_one("#pane-input", Input)
+        log = pane.query_one("#pane-log", RichLog)
         try:
             async for ev in self._voice.events():
                 if ev.kind == "partial":
@@ -269,20 +425,20 @@ class SenseUseApp(App):
         except asyncio.CancelledError:
             pass
 
+    # ---- archive --------------------------------------------------------
+
     async def action_archive(self) -> None:
-        if self.runner is None:
-            self.query_one("#log", RichLog).write("[dim]no active session to archive[/dim]")
+        pane = self._focused_pane()
+        if pane is None or pane.runner is None:
             return
-        session_id = self.runner.session.id
-        log = self.query_one("#log", RichLog)
+        session_id = pane.runner.session.id
+        log = pane.query_one("#pane-log", RichLog)
 
         async def _done(slug: str | None) -> None:
             if slug:
                 log.write(Text.from_markup(
-                    f"[green]📁 archived session {session_id[:8]}… to project [b]{slug}[/b][/green]"
+                    f"[green]📁 archived {session_id[:8]}… to [b]{slug}[/b][/green]"
                 ))
-            else:
-                log.write("[dim]archive cancelled[/dim]")
 
         self.push_screen(ProjectModal(session_id), _done)
 
@@ -291,5 +447,11 @@ def run(
     cdp_url: str = "http://127.0.0.1:9222",
     provider_key: str = "volc",
     config: Config | None = None,
+    targets: list[str] | None = None,
 ) -> None:
-    SenseUseApp(cdp_url=cdp_url, provider_key=provider_key, config=config).run()
+    SenseUseApp(
+        cdp_url=cdp_url,
+        provider_key=provider_key,
+        config=config,
+        targets=targets,
+    ).run()

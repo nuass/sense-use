@@ -68,12 +68,73 @@ class BrowserBackend(Backend):
     async def click(self, x: int, y: int, button: str = "left") -> ActionResult:
         assert self._page is not None
         await self._page.mouse.click(x, y, button=button)
+        # CDP mouse.click doesn't reliably focus the clicked element (activeElement
+        # stays on <body>), which breaks any subsequent typing/Enter. Manually
+        # focus whatever element is under the point after the click settles.
+        try:
+            await self._page.evaluate(
+                """([x, y]) => {
+                    const el = document.elementFromPoint(x, y);
+                    if (el && typeof el.focus === 'function') el.focus();
+                }""",
+                [x, y],
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return ActionResult(ok=True, detail=f"clicked ({x},{y})")
 
     async def type_text(self, text: str) -> ActionResult:
         assert self._page is not None
-        await self._page.keyboard.type(text, delay=20)
-        return ActionResult(ok=True, detail=f"typed {len(text)} chars")
+        # `keyboard.type()` sends keyDown events, which get intercepted by the
+        # system IME for CJK characters — the page ends up receiving IME
+        # candidates like "伊犁师范大学" instead of "行思智元". For any
+        # non-ASCII input we write directly to the currently focused element
+        # via evaluate(), which writes value directly and fires proper input
+        # events (also keeps focus so a subsequent Enter press submits).
+        is_ascii = all(ord(c) < 128 for c in text)
+        if is_ascii:
+            await self._page.keyboard.type(text, delay=20)
+            return ActionResult(ok=True, detail=f"typed {len(text)} chars")
+
+        # CJK / any non-ASCII: bypass IME by writing to document.activeElement.
+        js = """
+        (value) => {
+            const el = document.activeElement;
+            if (!el) return {ok: false, reason: 'no active element'};
+            const tag = el.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                const proto = tag === 'INPUT'
+                    ? HTMLInputElement.prototype
+                    : HTMLTextAreaElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return {ok: true, tag, name: el.name || el.id || ''};
+            }
+            if (el.isContentEditable) {
+                el.textContent = value;
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, data: value}));
+                return {ok: true, tag: 'contentEditable', name: ''};
+            }
+            return {ok: false, reason: 'active element is not editable: ' + tag};
+        }
+        """
+        try:
+            result = await self._page.evaluate(js, text)
+        except Exception as exc:  # noqa: BLE001
+            return ActionResult(ok=False, detail=f"insert failed: {exc}")
+        if not result.get("ok"):
+            # fallback: try keyboard.insert_text (works if IME layer plays nicely)
+            await self._page.keyboard.insert_text(text)
+            return ActionResult(
+                ok=True,
+                detail=f"typed {len(text)} chars (fallback insert_text; {result.get('reason')})",
+            )
+        return ActionResult(
+            ok=True,
+            detail=f"typed {len(text)} chars into <{result.get('tag')}>",
+        )
 
     async def swipe(
         self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300
@@ -89,9 +150,29 @@ class BrowserBackend(Backend):
 
     async def key(self, name: str) -> ActionResult:
         assert self._page is not None
-        # Normalize common names.
-        mapping = {"back": "BrowserBack", "home": "Home", "enter": "Enter", "esc": "Escape"}
-        key = mapping.get(name.lower(), name)
+        # Playwright uses `Control`, `Meta`, `Shift`, `Alt` for modifiers and
+        # joins chords with `+`, e.g. `Control+a`. Normalize common human forms.
+        mapping = {
+            "back": "BrowserBack",
+            "home": "Home",
+            "enter": "Enter",
+            "return": "Enter",
+            "esc": "Escape",
+            "escape": "Escape",
+            "tab": "Tab",
+            "space": "Space",
+            "ctrl": "Control",
+            "control": "Control",
+            "cmd": "Meta",
+            "command": "Meta",
+            "meta": "Meta",
+            "shift": "Shift",
+            "alt": "Alt",
+            "option": "Alt",
+        }
+        parts = [p.strip() for p in name.replace(" ", "").split("+") if p.strip()]
+        normalized = [mapping.get(p.lower(), p) for p in parts]
+        key = "+".join(normalized) if normalized else name
         await self._page.keyboard.press(key)
         return ActionResult(ok=True, detail=f"pressed {key}")
 

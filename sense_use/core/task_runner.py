@@ -102,33 +102,58 @@ class TaskRunner:
     async def _dispatch(self, d: ModelDecision):
         b = self.backend
         args = d.args
+        from sense_use.core.backend import ActionResult
+
+        def _missing(*keys: str) -> ActionResult | None:
+            missing = [k for k in keys if k not in args]
+            if missing:
+                return ActionResult(
+                    ok=False,
+                    detail=f"missing args {missing} for {d.action}; got {list(args.keys())}",
+                )
+            return None
+
         match d.action:
             case "click":
+                miss = _missing("x", "y")
+                if miss:
+                    return miss
                 return await b.click(int(args["x"]), int(args["y"]))
             case "type":
+                miss = _missing("text")
+                if miss:
+                    return miss
                 return await b.type_text(str(args["text"]))
             case "swipe":
+                miss = _missing("x1", "y1", "x2", "y2")
+                if miss:
+                    return miss
                 return await b.swipe(
                     int(args["x1"]), int(args["y1"]),
                     int(args["x2"]), int(args["y2"]),
                     int(args.get("duration_ms", 300)),
                 )
             case "key":
-                return await b.key(str(args["name"]))
+                miss = _missing("name")
+                if miss:
+                    return miss
+                try:
+                    return await b.key(str(args["name"]))
+                except Exception as exc:  # noqa: BLE001
+                    return ActionResult(ok=False, detail=f"key press failed: {exc}")
             case "goto":
+                miss = _missing("url")
+                if miss:
+                    return miss
                 if hasattr(b, "goto"):
                     return await b.goto(str(args["url"]))  # type: ignore[attr-defined]
-                from sense_use.core.backend import ActionResult
                 return ActionResult(ok=False, detail="backend does not support goto")
             case "read":
                 if hasattr(b, "read_text"):
                     text = await b.read_text()  # type: ignore[attr-defined]
-                    from sense_use.core.backend import ActionResult
                     return ActionResult(ok=True, detail=f"read {len(text)} chars", data={"text": text[:4000]})
-                from sense_use.core.backend import ActionResult
                 return ActionResult(ok=False, detail="backend does not support read")
             case _:
-                from sense_use.core.backend import ActionResult
                 return ActionResult(ok=False, detail=f"unknown action {d.action}")
 
     async def _emit(self, kind, payload):
