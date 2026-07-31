@@ -10,6 +10,9 @@ from sense_use.core.session import Session
 from sense_use.models.base import ModelDecision, ModelProvider
 
 
+GuardianCheckFn = object
+
+
 class TaskRunner:
     def __init__(
         self,
@@ -24,6 +27,11 @@ class TaskRunner:
         self.bus = bus
         self._history: list[dict] = []
         self._pending_confirm: asyncio.Future[bool] | None = None
+        # v0.3.4 Guardian split: if set, use this async fn instead
+        # of backend.is_sensitive() + local confirm. Signature:
+        # async def guardian_check(action: str, args: dict, label: str,
+        #                          sess: Session) -> tuple[allow: bool, reason: str]
+        self.guardian_check: GuardianCheckFn | None = None
 
     async def resolve_confirm(self, ok: bool) -> None:
         if self._pending_confirm and not self._pending_confirm.done():
@@ -67,18 +75,27 @@ class TaskRunner:
                     await self._emit("done", {"answer": answer})
                     return str(answer)
 
-                if self.backend.is_sensitive(decision.action, {**decision.args, "label": decision.label}):
-                    self._pending_confirm = asyncio.get_event_loop().create_future()
-                    await self._emit("confirm_needed", {
-                        "action": decision.action, "args": decision.args, "label": decision.label,
-                    })
-                    ok = await self._pending_confirm
-                    await self._emit("confirm_result", {"ok": ok})
-                    if not ok:
-                        self._history.append(
-                            {"action": decision.action, "args": decision.args, "result": "user_rejected"}
-                        )
-                        continue
+                sensitive_args = {**decision.args, "label": decision.label}
+                if self.guardian_check is not None:
+                    # v0.3.4 Guardian Gateway: HTTP round-trip
+                    ok, reason = await self.guardian_check(
+                        decision.action, sensitive_args, decision.label, self.session
+                    )
+                else:
+                    # Pre-v0.3.4: backend-local rule + TUI confirm
+                    ok = True
+                    if self.backend.is_sensitive(decision.action, sensitive_args):
+                        self._pending_confirm = asyncio.get_event_loop().create_future()
+                        await self._emit("confirm_needed", {
+                            "action": decision.action, "args": decision.args, "label": decision.label,
+                        })
+                        ok = await self._pending_confirm
+                        await self._emit("confirm_result", {"ok": ok})
+                if not ok:
+                    self._history.append(
+                        {"action": decision.action, "args": decision.args, "result": "user_rejected"}
+                    )
+                    continue
 
                 result = await self._dispatch(decision)
                 await self._emit("act_result", {

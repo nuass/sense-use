@@ -15,16 +15,19 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.widget import Widget
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from sense_use.config import Config
 from sense_use.core.event_bus import Event
+from sense_use.guardian_gateway import PendingConfirm, create_app as create_guardian_app
 from sense_use.models import provider_registry
 from sense_use.store.session_store import SessionStore
 from sense_use.tui.screens.confirm_modal import ConfirmModal
 from sense_use.tui.screens.memory_modal import MemoryModal
 from sense_use.tui.screens.project_modal import ProjectModal
 from sense_use.tui.widgets.memory_tree import MemoryTree
+from sense_use.tui.widgets.pane_grid import PaneGrid, columns_for
 from sense_use.tui.widgets.target_pane import TargetPane
 from sense_use.tui.widgets.target_picker import TargetPicker
 from sense_use.tui.widgets.voice_input import VoiceCapture
@@ -132,6 +135,49 @@ def _short_cdp(url: str) -> str:
     return url.split("://", 1)[-1].rstrip("/")
 
 
+def _short_title(kind: str, full_title: str) -> str:
+    """Compact pane title for grid mode (1-3 char prefix + endpoint digits).
+
+    Examples (3+ panes):
+        browser @ 9222        -> b9222
+        browser @ 192.168.1.4 -> b9222        (uses cdp port)
+        adb @ TWPVAEUWQ4QW..  -> a·TWPV      (first 4 of serial)
+        adb @ 192.168.1.79:.  -> a·41065
+        desktop (mon 2)       -> desk·2
+        vnc @ 10.0.0.5:5901   -> vnc·5901
+    """
+    import re
+    if kind == "browser":
+        # pull last :PORT out of "browser @ 127.0.0.1:9222"
+        m = re.search(r":(\d+)\b", full_title)
+        if m:
+            return f"b{m.group(1)}"
+        return "browser"
+    if kind == "adb":
+        # "adb @ 192.168.1.79:41065" -> a·41065
+        # "adb @ TWPVAEUWQ4QWNR9H"  -> a·TWPV
+        m = re.search(r":(\d+)\b", full_title)
+        if m:
+            return f"a·{m.group(1)}"
+        m = re.search(r"@ (\w+)", full_title)
+        if m:
+            return f"a·{m.group(1)[:4]}"
+        return "adb"
+    if kind == "desktop":
+        # "desktop (mon 2)" -> desk·2 / "desktop (this mac)" -> desk·M
+        m = re.search(r"mon (\d+)", full_title)
+        if m:
+            return f"desk·{m.group(1)}"
+        return "desk"
+    if kind == "vnc":
+        # "vnc @ 10.0.0.5:5901" -> vnc·5901
+        m = re.search(r":(\d+)\b", full_title)
+        if m:
+            return f"vnc·{m.group(1)}"
+        return "vnc"
+    return full_title[:8]
+
+
 def _build_target_factory(kind: str, kwargs: dict):
     """Return a zero-arg callable that builds the Backend for `kind`.
 
@@ -159,7 +205,7 @@ class SenseUseApp(App):
     Screen { layout: vertical; }
     #main { height: 1fr; }
     #sidebar { width: 26; border-right: solid $primary; }
-    #panes { layout: horizontal; height: 1fr; }
+    #panes { height: 1fr; }
     RichLog { background: $surface; }
     """
 
@@ -212,7 +258,7 @@ class SenseUseApp(App):
                 else:
                     yield TargetPicker(id="picker")
                 yield MemoryTree(id="memtree")
-            with Horizontal(id="panes"):
+            with PaneGrid(id="panes", initial_columns=columns_for(len(self.targets))):
                 try:
                     self._provider = self._build_provider()
                 except Exception as exc:  # noqa: BLE001
@@ -233,7 +279,16 @@ class SenseUseApp(App):
 
         Used both at first render (with --targets) and lazily when the picker
         emits TargetsChosen — the caller mount()s the yielded widgets.
+
+        Title shortening kicks in once the grid has more than one column
+        (i.e. 4+ panes), since the long form (``browser @ 9222``) is too
+        wide for the ~20-col cells of a 3x3 layout.
         """
+        # Decide shortening up-front: we know the *target* total so the
+        # caller can pre-pick the right column count.
+        projected_total = len(self.panes) + len(specs)
+        cols = columns_for(projected_total)
+        use_short = cols > 1
         for i, spec in enumerate(specs):
             pane_id = f"pane-{len(self.panes) + i}"
             try:
@@ -242,10 +297,11 @@ class SenseUseApp(App):
             except ValueError as exc:
                 yield Static(f"[red]skip pane {spec!r}: {exc}[/red]")
                 continue
+            display_title = _short_title(kind, title) if use_short else title
             pane = TargetPane(
-                title=title,
-                backend_factory=factory,
-                provider=self._provider,  # type: ignore[arg-type]
+                title=display_title,
+                backend_spec=spec,
+                provider_key=self.provider_key,
                 on_confirm_needed=self._on_pane_confirm_needed,
                 pane_id=pane_id,
             )
@@ -256,7 +312,7 @@ class SenseUseApp(App):
         self, message: TargetPicker.TargetsChosen
     ) -> None:
         """User pressed 'Attach selected' — mount panes for the chosen specs."""
-        panes_container = self.query_one("#panes", Horizontal)
+        panes_container = self.query_one("#panes", PaneGrid)
         # Clear the empty-hint placeholder on first attach.
         try:
             self.query_one("#empty-hint", Static).remove()
@@ -264,12 +320,17 @@ class SenseUseApp(App):
             pass
         # Deduplicate against already-attached specs (metadata check on title).
         existing_titles = {p.title for p in self.panes.values()}
+        new_widgets: list[Widget] = []
         for widget in self._spawn_panes(message.specs):
             if isinstance(widget, TargetPane) and widget.title in existing_titles:
                 # already have this pane — skip
                 self.panes.pop(widget.id or "", None)
                 continue
-            await panes_container.mount(widget)
+            new_widgets.append(widget)
+        for w in new_widgets:
+            await panes_container.mount(w)
+        # Recompute grid columns to match the new pane count.
+        panes_container.recompute_for(len(self.panes))
 
     def _build_provider(self):
         kwargs = self.config.provider_kwargs(self.provider_key)
@@ -282,7 +343,29 @@ class SenseUseApp(App):
 
     async def on_mount(self) -> None:
         # Panes render their own welcome via TargetPane on_mount.
-        pass
+        # Start v0.3.4 Guardian Gateway in-process on port 8775.
+        # The confirm callback routes to the correct pane's modal.
+        def _guardian_confirm_callback(pending: PendingConfirm) -> None:
+            pane = self.panes.get(pending.pane_id)
+            if pane is not None and pane._on_confirm_needed:  # noqa: SLF001
+                def _after(ok: bool | None) -> None:
+                    if not pending.future.done():
+                        pending.future.set_result((bool(ok), "user confirmed" if ok else "user rejected"))
+                self.push_screen(ConfirmModal(pending.action, pending.label, pending.args), _after)
+
+        guardian = create_guardian_app(mode="local", confirm_callback=_guardian_confirm_callback)
+        self._guardian_task = asyncio.create_task(self._run_guardian(guardian, 8775))
+
+    async def _run_guardian(self, app, port: int) -> None:
+        import hypercorn.asyncio
+        from hypercorn.config import Config
+        cfg = Config()
+        cfg.bind = [f"127.0.0.1:{port}"]
+        cfg.loglevel = "error"
+        try:
+            await hypercorn.asyncio.serve(app, cfg)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def on_paste(self, event: events.Paste) -> None:
         """Flatten multi-line paste into the focused pane's input."""
