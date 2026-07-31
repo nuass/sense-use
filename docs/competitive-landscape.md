@@ -1,12 +1,20 @@
 # sense-use · 竞品地图 (Competitive Landscape)
 
-> 2026-07-24 扫描窗口：**最近 5 个月**（2026-02-24 ~ 2026-07-24）。
+> 2026-07-31 v0.2 同步：补 Demo 视频入口 + 与 brief 口径一致 + 加 v0.3 待观察对象
+> 原始 2026-07-24 扫描窗口：**最近 5 个月**（2026-02-24 ~ 2026-07-24）。
 > star 与 Δ5m（近 5 个月增长）为扫描时的近似值，用于横向排序、非精确基准。
 
 **用途**：
 - 决定 sense-use 哪些模块**依赖已有轮子**、哪些**必须自研**
 - 提供对外 pitch/README 的差异化对标口径
 - 每季度更新一次（M2/M3/M4 完成时各刷一次）
+
+**v0.2 对应 Demo 证据**（2026-07-31 实测）：
+- 三端真机：browser+adb+desktop 3 pane 同屏（demo.mp4 0-3s）
+- 闭环真答：browser 1 步答出 "Anthropic Computer Use is closed-source and desktop-only."
+- 跨端并行：browser+adb 同时 dispatch 不同 goal
+- 真 memory 树：归档后 sidebar 实时出现 3 条新 entry
+- 优雅降级：Voice 无 mic 时显示红字 "🎙 voice unavailable"
 
 ---
 
