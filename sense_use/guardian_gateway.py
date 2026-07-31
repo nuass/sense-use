@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -79,9 +80,40 @@ class PendingConfirm:
 ConfirmCallback = Callable[[PendingConfirm], None]
 
 
+# Actions that are refused outright — no human is asked, because there is no
+# legitimate reason for the model to reach for them.
+_DESTRUCTIVE_ACTIONS = ("delete", "drop", "truncate")
+
+# A label matching this is worth a human's attention: money movement,
+# irreversible removal, or losing the session. Mirrors the union of the
+# per-backend patterns these rules were centralized from.
+_SENSITIVE_LABEL = re.compile(
+    r"(pay|checkout|purchase|delete|remove|uninstall|wipe|logout|sign\s?out|"
+    r"confirm\s?order|transfer|"
+    r"支付|付款|转账|删除|卸载|注销|退出登录|确认下单|确认支付)",
+    re.IGNORECASE,
+)
+
+
+def _needs_human(action: str, args: dict[str, Any], label: str) -> bool:
+    """Whether this action should block on a human decision.
+
+    Everything else runs unattended. Prompting on every click would train
+    the operator to reflexively approve, which defeats the point of asking.
+    """
+    if _SENSITIVE_LABEL.search(label or ""):
+        return True
+    if _SENSITIVE_LABEL.search(str(args.get("text", "") or "")):
+        return True
+    # macOS menu bar strip — a stray click here can hit system-level items.
+    if action == "click" and int(args.get("y", 9999) or 9999) <= 30:
+        return True
+    return False
+
+
 def _blocked_by_default(action: str) -> tuple[bool, str]:
     """Built-in safety rules: block actions known to be destructive."""
-    if action in ("delete", "drop", "truncate"):
+    if action in _DESTRUCTIVE_ACTIONS:
         return False, "automatically blocked: destructive database action"
     return True, "no matching rule — default allow"
 
@@ -120,6 +152,12 @@ def create_app(
             )
 
         if mode == "local":
+            if not _needs_human(req.action, req.args, req.label):
+                return CheckResponse(
+                    allow=True,
+                    reason="not sensitive — auto-approved",
+                    approved_by="rule:auto",
+                )
             if confirm_callback is None:
                 raise HTTPException(status_code=500, detail="local mode requires confirm_callback")
             screenshot_bytes = (

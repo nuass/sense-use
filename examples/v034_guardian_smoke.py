@@ -42,7 +42,7 @@ async def main() -> int:
             session_id="smoke-123",
             pane_id="pane-0",
             action="click",
-            label="Click Search",
+            label="Confirm payment",
             args={"x": 100, "y": 200},
             backend_kind="browser",
         )

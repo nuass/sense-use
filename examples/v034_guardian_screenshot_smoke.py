@@ -62,7 +62,7 @@ async def check_gateway_roundtrip() -> None:
 
         result = await client.check(
             session_id="s1", pane_id="pane-0", action="click",
-            label="Click Search", args={"x": 1, "y": 2},
+            label="Confirm payment", args={"x": 1, "y": 200},
             backend_kind="browser", screenshot_bytes=PNG,
         )
         assert result.allow is True, result.reason
@@ -74,8 +74,17 @@ async def check_gateway_roundtrip() -> None:
         )
         print(f"[v034] ✓ screenshot survived round-trip ({len(got)} bytes, PNG magic intact)")
 
-        # Destructive action must be blocked by rule, not sent to the user.
+        # A benign action must NOT interrupt the operator.
         before = len(received)
+        benign = await client.check(
+            session_id="s1", pane_id="pane-0", action="click",
+            label="Search box", args={"x": 40, "y": 300}, backend_kind="browser",
+        )
+        assert benign.allow is True and benign.approved_by == "rule:auto", benign
+        assert len(received) == before, "benign click must not reach the confirm callback"
+        print("[v034] ✓ benign click auto-approved, operator not prompted")
+
+        # Destructive action must be blocked by rule, not sent to the user.
         blocked = await client.check(
             session_id="s1", pane_id="pane-0", action="delete",
             label="Delete all rows", args={}, backend_kind="browser",
@@ -85,14 +94,14 @@ async def check_gateway_roundtrip() -> None:
         assert len(received) == before, "delete must NOT reach the confirm callback"
         print(f"[v034] ✓ 'delete' blocked by rule, callback not invoked: {blocked.reason!r}")
 
-        # A non-destructive 'key' action still requires confirmation.
+        # A sensitive label must reach the human.
         keyres = await client.check(
-            session_id="s1", pane_id="pane-0", action="key",
-            label="Press Enter", args={"name": "enter"}, backend_kind="browser",
+            session_id="s1", pane_id="pane-0", action="click",
+            label="确认支付", args={"x": 5, "y": 400}, backend_kind="adb",
         )
         assert keyres.allow is True and keyres.approved_by == "tui:local_user", keyres
-        assert len(received) == before + 1, "key action should reach the callback"
-        print("[v034] ✓ 'key' action routed to confirm callback (no dead-rule bypass)")
+        assert len(received) == before + 1, "sensitive label should reach the callback"
+        print("[v034] ✓ sensitive label (确认支付) routed to human confirmation")
     finally:
         server.cancel()
         try:
@@ -141,7 +150,7 @@ async def check_worker_wiring() -> None:
                                payload={"step": 1, "screenshot_bytes": PNG}))
         await asyncio.sleep(0.1)
 
-        allow, reason = await guardian_check("click", {"x": 5}, "Tap Send", _Sess())
+        allow, reason = await guardian_check("click", {"x": 5, "y": 400}, "确认支付", _Sess())
         pump.cancel()
 
         assert allow is True, reason
