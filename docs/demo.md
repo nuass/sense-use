@@ -122,6 +122,35 @@ agg demo.cast demo.gif --theme monokai --font-size 14
 
 Trim to ~90s. Drop `demo.gif` at the top of README (before `## Why`).
 
+## Automated demo runners
+
+The repo ships two CI-friendly runners in [`examples/`](../examples/) that
+don't require a human at the keyboard:
+
+| Script | What it does | Output |
+|---|---|---|
+| `examples/headless_demo.py` | Imports `BrowserBackend + ClaudeProvider + TaskRunner` directly. No TUI. Runs one goal to completion, emits per-step PNG + transcript.jsonl. | `~/.sense-use/sessions/demos/<sid>/` |
+| `examples/tui_snapshots.py` | Drives the real Textual app via `app.run_test()` (Pilot). Boots 3 panes, types a goal, dispatches, captures Tab switching, voice-toggle error, archive modal, real memory-tree. Exports SVG → 1600w PNG → GIF + MP4. | `~/.sense-use/sessions/tui-snapshots/<sid>/` |
+
+The `tui_snapshots` runner uses Textual's native `App.export_screenshot()`
+(SVG) — no terminal emulator, no `asciinema`, no `agg`. It works on any host
+with a working Claude API key and a Chrome 9222; reproducible to the byte
+level.
+
+```bash
+# 1. Headless verification (works in CI, no TTY):
+PYTHONPATH=. python examples/headless_demo.py \
+    "Open https://github.com/nuass/sense-use and tell me the first sentence of the README's Why section"
+
+# 2. Visual capture (also headless, but renders the TUI):
+PYTHONPATH=. python examples/tui_snapshots.py
+# → 17 SVG + 17 PNG (1600w) + demo.gif (27 MB) + demo.mp4 (108 KB)
+#    in ~/.sense-use/sessions/tui-snapshots/<sid>/
+```
+
+The committed demo MP4 + key screenshots in `docs/screenshots/` come from a
+run on 2026-07-31.
+
 ## Troubleshooting
 
 - **`failed to connect CDP`** — Chrome not started, or missing

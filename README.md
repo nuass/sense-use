@@ -97,6 +97,32 @@ Inside the TUI:
 - `Ctrl+S` — archive the current session to a project.
 - Click a Memory entry in the sidebar to open the editor (`Ctrl+S` inside saves).
 
+## Demo
+
+<video src="docs/screenshots/demo.mp4" controls width="100%"></video>
+
+Three targets side-by-side, Claude driving Chrome, an Android pane running in
+parallel, then archive + memory tree populated:
+
+![multi-pane](docs/screenshots/01-multipane-running.png)
+![memory tree](docs/screenshots/02-memory-populated.png)
+![archive modal](docs/screenshots/03-archive-modal.png)
+
+Reproduce the demo locally — both runners are in [`examples/`](examples/):
+
+```bash
+# 1. Headless verification (no TUI, just transcript + per-step PNG):
+PYTHONPATH=. python examples/headless_demo.py \
+    "Open https://github.com/nuass/sense-use and tell me the first sentence of the README's Why section"
+
+# 2. TUI visual capture (drives the real Textual app via Pilot, exports
+#    SVG → PNG → GIF + MP4 — no asciinema/agg):
+PYTHONPATH=. python examples/tui_snapshots.py
+# → outputs to ~/.sense-use/sessions/tui-snapshots/<sid>/
+```
+
+The five-minute walkthrough script is in [`docs/demo.md`](docs/demo.md).
+
 ## Providers
 
 ```
