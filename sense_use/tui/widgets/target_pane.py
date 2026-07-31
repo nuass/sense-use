@@ -1,12 +1,16 @@
-"""TargetPane — a self-contained agent lane for one Backend.
+"""TargetPane — a self-contained agent lane for one Backend subprocess.
 
-Each pane owns its own {Backend, TaskRunner, EventBus, Session, Input, RichLog}
-so multiple targets (browser / adb / desktop / vnc) can run side-by-side in
-the same TUI without stepping on each other.
+Since v0.3.3 (GOAI AgentTeams compliance) the TaskRunner and Backend
+live in a dedicated worker subprocess managed by ``WorkerProcess``. No
+state leaks between panes, and crashing a worker won't take down the TUI.
 
-The pane is UI-only: it does not know about the outer app's memory sidebar or
-project archiver. The outer app queries the pane for its runner/session when
-those features fire.
+Each pane spawns one ``python -m sense_use.worker`` when the user
+submits a goal. Worker stdout is NDJSON; we pump it into the RichLog
+and LivePreview widget. Confirmations go back through worker stdin.
+
+The pane is UI-only: it does not know about the outer app's memory
+sidebar or project archiver. The outer app queries the pane for its
+worker when those features fire.
 """
 
 from __future__ import annotations
@@ -19,29 +23,25 @@ from textual.containers import Vertical
 from textual.widget import Widget
 from textual.widgets import Input, RichLog, Static
 
-from sense_use.core.backend import Backend
-from sense_use.core.event_bus import Event, EventBus
-from sense_use.core.session import Session
-from sense_use.core.task_runner import TaskRunner
-from sense_use.models.base import ModelProvider
+from sense_use.tui.widgets.live_preview import LivePreview
+from sense_use.worker_proc import WorkerProcess
 
 
 class TargetPane(Widget):
-    """One agent lane for a single Backend.
+    """One agent lane for a single Backend subprocess.
 
     Parameters
     ----------
     title:
         Human label shown at the top of the pane (e.g. "browser @ 9222").
-    backend_factory:
-        Zero-arg callable that returns a fresh Backend on demand. We defer
-        construction so an unreachable target (no adb device, no CDP) only
-        fails when the user tries to use it, not on TUI boot.
-    provider:
-        Shared ModelProvider — cheap and stateless, safe to share across panes.
+    backend_spec:
+        ``--targets`` style spec string passed to the worker subprocess
+        (e.g. "browser", "adb@SERIAL", "desktop", "vnc@host:port:passwd").
+    provider_key:
+        Model provider name for the worker subprocess (e.g. "claude", "volc").
     on_confirm_needed:
         Callback ``(pane, action, label, args) -> None`` the outer app uses to
-        pop a ConfirmModal. The pane still owns the resolve future.
+        pop a ConfirmModal. The pane sends the reply back to the worker via stdin.
     """
 
     DEFAULT_CSS = """
@@ -52,6 +52,7 @@ class TargetPane(Widget):
     }
     TargetPane > Vertical { height: 100%; }
     TargetPane #pane-title { padding: 0 1; background: $primary 20%; text-style: bold; }
+    TargetPane LivePreview { height: 10; }
     TargetPane RichLog { height: 1fr; background: $surface; }
     TargetPane Input { dock: bottom; }
     TargetPane.-focused { border: solid $success; }
@@ -60,22 +61,18 @@ class TargetPane(Widget):
     def __init__(
         self,
         title: str,
-        backend_factory,
-        provider: ModelProvider,
+        backend_spec: str,
+        provider_key: str,
         on_confirm_needed=None,
         pane_id: str | None = None,
     ) -> None:
         super().__init__(id=pane_id)
         self.title = title
-        self._backend_factory = backend_factory
-        self.provider = provider
+        self.backend_spec = backend_spec
+        self.provider_key = provider_key
         self._on_confirm_needed = on_confirm_needed
 
-        self.bus = EventBus()
-        self.backend: Backend | None = None
-        self.runner: TaskRunner | None = None
-        self._runner_task: asyncio.Task | None = None
-        self._sub: asyncio.Queue[Event] | None = None
+        self._worker: WorkerProcess | None = None
         self._pump_task: asyncio.Task | None = None
         self._confirm_active = False
         self._log_buffer: list[str] = []
@@ -85,82 +82,86 @@ class TargetPane(Widget):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(f"[b]{self.title}[/b] · [dim]idle[/dim]", id="pane-title", markup=True)
+            yield LivePreview(pane_id="pane-preview")
             yield RichLog(id="pane-log", wrap=True, markup=True, highlight=True)
             yield Input(placeholder=f"goal for {self.title} (Enter to run)…", id="pane-input")
 
     async def on_mount(self) -> None:
-        self._sub = self.bus.subscribe()
-        self._pump_task = asyncio.create_task(self._pump_events())
+        # No-op now; we don't have a bus until a worker is spawned.
+        pass
 
     async def on_unmount(self) -> None:
-        if self._pump_task is not None:
+        if self._pump_task is not None and not self._pump_task.done():
             self._pump_task.cancel()
-        if self._runner_task is not None and not self._runner_task.done():
-            self._runner_task.cancel()
-        if self.backend is not None:
-            try:
-                await self.backend.stop()
-            except Exception:  # noqa: BLE001
-                pass
+        if self._worker is not None:
+            await self._worker.stop()
 
     # ---- event pump ----------------------------------------------------
 
-    async def _pump_events(self) -> None:
-        log = self.query_one("#pane-log", RichLog)
-        assert self._sub is not None
-        while True:
-            ev = await self._sub.get()
-            self._render_event(log, ev)
+    async def _pump_events(self, worker: WorkerProcess, log: RichLog) -> None:
+        async for p in worker.events():
+            event_kind = p.get("event", "unknown")
+            plain: str | None = None
+            if event_kind == "user_msg":
+                plain = f"🧑 {p.get('goal', '')}"
+                log.write(Text.from_markup(f"[bold]🧑 {p.get('goal', '')}[/bold]"))
+            elif event_kind == "observe":
+                size = len(p.get("screenshot_bytes", b""))
+                step = p.get("step", 0)
+                plain = f"👁 step {step} · {size}b"
+                log.write(Text.from_markup(f"[dim]{plain}[/dim]"))
+                try:
+                    self.query_one(LivePreview).set_bytes(
+                        p.get("screenshot_bytes"), step=step,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif event_kind == "think":
+                thought = (p.get("thought", "") or "")[:80]
+                action = p.get("action", "")
+                step = p.get("step", 0)
+                plain = f"🧠 s{step} {thought}\n   → {action} {p.get('args')}"
+                log.write(Text.from_markup(
+                    f"[yellow]🧠 s{step}[/yellow] {thought}\n"
+                    f"   [cyan]→ {action} {p.get('args')}[/cyan]"
+                ))
+            elif event_kind == "act_result":
+                ok = p.get("ok", False)
+                color = "green" if ok else "red"
+                mark = "✔" if ok else "✖"
+                action = p.get("action", "")
+                detail = p.get("detail", "")
+                plain = f"{mark} {action} — {detail}"
+                log.write(Text.from_markup(
+                    f"[{color}]{mark} {action} — {detail}[/{color}]"
+                ))
+            elif event_kind == "confirm_needed":
+                self._confirm_active = True
+                action = p.get("action", "")
+                label = p.get("label", "")
+                plain = f"⚠ CONFIRM {action} on {label}"
+                log.write(Text.from_markup(
+                    f"[bold magenta]⚠ CONFIRM[/bold magenta] {action} on [u]{label}[/u]"
+                ))
+                if self._on_confirm_needed is not None:
+                    self._on_confirm_needed(
+                        self, action, label, p.get("args", {}),
+                    )
+            elif event_kind == "confirm_result":
+                self._confirm_active = False
+            elif event_kind == "done":
+                answer = p.get("answer", "")
+                plain = f"✅ {answer}"
+                log.write(Text.from_markup(f"[bold green]✅ {answer}[/bold green]"))
+                self._set_title_status("done")
+            elif event_kind == "error":
+                reason = p.get("reason", "")
+                plain = f"✖ {reason}"
+                log.write(Text.from_markup(f"[bold red]✖ {reason}[/bold red]"))
+                self._set_title_status("error")
 
-    def _render_event(self, log: RichLog, ev: Event) -> None:
-        p = ev.payload
-        plain: str | None = None
-        if ev.kind == "user_msg":
-            plain = f"🧑 {p.get('goal','')}"
-            log.write(Text.from_markup(f"[bold]🧑 {p.get('goal','')}[/bold]"))
-        elif ev.kind == "observe":
-            n = p.get("screenshot_bytes")
-            size = n if isinstance(n, int) else (len(n) if n else 0)
-            plain = f"👁 step {p.get('step')} · {size}b"
-            log.write(Text.from_markup(f"[dim]{plain}[/dim]"))
-        elif ev.kind == "think":
-            plain = (
-                f"🧠 s{p.get('step')} {p.get('thought','')[:80]}\n"
-                f"   → {p.get('action')} {p.get('args')}"
-            )
-            log.write(Text.from_markup(
-                f"[yellow]🧠 s{p.get('step')}[/yellow] {p.get('thought','')[:80]}\n"
-                f"   [cyan]→ {p.get('action')} {p.get('args')}[/cyan]"
-            ))
-        elif ev.kind == "act_result":
-            ok = p.get("ok")
-            color = "green" if ok else "red"
-            mark = "✔" if ok else "✖"
-            plain = f"{mark} {p.get('action')} — {p.get('detail','')}"
-            log.write(Text.from_markup(
-                f"[{color}]{mark} {p.get('action')} — {p.get('detail','')}[/{color}]"
-            ))
-        elif ev.kind == "confirm_needed":
-            self._confirm_active = True
-            plain = f"⚠ CONFIRM {p.get('action')} on {p.get('label','')}"
-            log.write(Text.from_markup(
-                f"[bold magenta]⚠ CONFIRM[/bold magenta] {p.get('action')} on [u]{p.get('label','')}[/u]"
-            ))
-            if self._on_confirm_needed is not None:
-                self._on_confirm_needed(self, p.get("action", ""), p.get("label", ""), p.get("args", {}))
-        elif ev.kind == "confirm_result":
-            self._confirm_active = False
-        elif ev.kind == "done":
-            plain = f"✅ {p.get('answer','')}"
-            log.write(Text.from_markup(f"[bold green]✅ {p.get('answer','')}[/bold green]"))
-            self._set_title_status("done")
-        elif ev.kind == "error":
-            plain = f"✖ {p.get('reason','')}"
-            log.write(Text.from_markup(f"[bold red]✖ {p.get('reason','')}[/bold red]"))
-            self._set_title_status("error")
-
-        if plain is not None:
-            self._log_buffer.append(plain)
+            if plain is not None:
+                self._log_buffer.append(plain)
 
     def _set_title_status(self, status: str) -> None:
         try:
@@ -182,7 +183,7 @@ class TargetPane(Widget):
         event.input.value = ""
         if not goal:
             return
-        if self._runner_task is not None and not self._runner_task.done():
+        if self._worker is not None and self._pump_task is not None and not self._pump_task.done():
             self.query_one("#pane-log", RichLog).write(
                 Text.from_markup("[dim]⏳ busy — wait for current run[/dim]")
             )
@@ -192,40 +193,40 @@ class TargetPane(Widget):
 
     async def _start_run(self, goal: str) -> None:
         log = self.query_one("#pane-log", RichLog)
-        # (Re)create backend for each run so a crashed backend from a prior
-        # run doesn't leak state. Providers are stateless — reuse.
+        # Stop any prior worker that somehow didn't clean up.
+        if self._worker is not None:
+            await self._worker.stop()
+        self._log_buffer.clear()
+        self._set_title_status("running")
+
+        self._worker = WorkerProcess(
+            backend_spec=self.backend_spec,
+            provider_key=self.provider_key,
+            goal=goal,
+        )
         try:
-            self.backend = self._backend_factory()
-            await self.backend.start()
+            await self._worker.start()
         except Exception as exc:  # noqa: BLE001
-            log.write(Text.from_markup(f"[red]backend start failed: {exc}[/red]"))
+            log.write(Text.from_markup(f"[red]worker spawn failed: {exc}[/red]"))
             self._set_title_status("error")
             return
 
-        session = Session(goal=goal)
-        self.runner = TaskRunner(
-            session=session, backend=self.backend, provider=self.provider, bus=self.bus,
-        )
-        log.write(Text.from_markup(f"[dim]session {session.id[:8]}… started[/dim]"))
-        self._set_title_status("running")
-
-        async def _go():
+        # The pump coro reads NDJSON from the worker stdout, converts
+        # to RichLog lines and LivePreview updates. It finishes when
+        # the worker exits (done / error / killed).
+        async def _pump():
             try:
-                await self.runner.run()  # type: ignore[union-attr]
+                await self._pump_events(self._worker, log)
             finally:
-                if self.backend is not None:
-                    try:
-                        await self.backend.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
+                pass
 
-        self._runner_task = asyncio.create_task(_go())
+        self._pump_task = asyncio.create_task(_pump())
 
     # ---- helpers exposed to outer app ---------------------------------
 
     async def resolve_confirm(self, ok: bool) -> None:
-        if self.runner is not None and self._confirm_active:
-            await self.runner.resolve_confirm(ok)
+        if self._worker is not None and self._confirm_active:
+            await self._worker.send_confirm(ok)
 
     @property
     def confirm_active(self) -> bool:

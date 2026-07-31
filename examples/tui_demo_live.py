@@ -16,14 +16,14 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/Users/cony.zhangbjgmail.com/dev/sense-use")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sense_use.config import ensure_config_exists, load_config
 from sense_use.tui.app import SenseUseApp
 from sense_use.tui.widgets.target_pane import TargetPane
 from textual.widgets import Input
 
-ADB_SERIAL = "192.168.1.79:41065"
+ADB_SERIAL = "TWPVAEUWQ4QWNR9H"  # USB PEAM00 (wifi dropped earlier)
 GOAL_BROWSER = "Open https://github.com/nuass/sense-use and tell me the first sentence of the README's Why section"
 GOAL_ADB = "Press HOME, then take a screenshot and describe the current foreground app briefly"
 TARGETS = ["browser", f"adb@{ADB_SERIAL}"]
@@ -32,12 +32,17 @@ TASK_TIMEOUT_S = 75
 
 
 def pane_by_kind(app: SenseUseApp, kind: str) -> TargetPane:
-    """Find the TargetPane by its title prefix."""
+    """Find the TargetPane by its title prefix.
+
+    Since v0.3.2, titles are shortened in grid mode (b9222 / a·TWPV),
+    so we map ``kind`` to its short prefix.
+    """
+    short_prefix = {"browser": "b", "adb": "a"}.get(kind, kind)
     for p in app.query(TargetPane):
         title = (p.title or "").lower()
-        if title.startswith(kind):
+        if title.startswith(short_prefix):
             return p
-    raise RuntimeError(f"no pane for {kind}")
+    raise RuntimeError(f"no pane for {kind} (short_prefix={short_prefix!r})")
 
 
 def pane_input_for(pane: TargetPane) -> Input:

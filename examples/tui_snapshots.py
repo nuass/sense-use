@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/Users/cony.zhangbjgmail.com/dev/sense-use")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sense_use.config import ensure_config_exists, load_config
 from sense_use.store import project_store
