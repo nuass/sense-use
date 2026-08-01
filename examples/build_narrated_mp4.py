@@ -34,7 +34,24 @@ PS_SAY = ("每个窗格都是一个独立的操作系统进程。"
           "这是运行时抓下来的真实进程表，"
           "标准输入输出流转任务、画面和审批请求。")
 PS_OVERLAY = "进程隔离实证 · 每个窗格独立进程 · 通过 stdio 协同"
+VISION_SAY = ("这是模型这一步真正看到的画面，原始截图，不是示意图。"
+              "左边是浏览器渲染出的页面，右边是安卓真机的实时屏幕。"
+              "终端窗格里的小图只是缩略预览，原图完整留在会话目录里。")
+VISION_OVERLAY = "模型的真实视野 · 原始截图 · 逐步留存在会话目录"
+# Panes are titled with the TUI's grid abbreviations (b9222, a·TWPV, desk·2,
+# vnc·5901), so match on those prefixes rather than the backend kind. Order
+# is also the left-to-right layout order.
+PANE_LABELS = [
+    ("b", "浏览器 · 模型看到的页面"),
+    ("a", "安卓真机 · 实时屏幕"),
+    ("desk", "桌面 · 实时画面"),
+    ("vnc", "远端 VNC · 实时画面"),
+]
 PAD_S = 0.45  # breathing room after each narration line
+# Frames carry a real browser page and a phone screen, so the video has to
+# be wide enough to read them; the SVGs and cards are rendered at this width
+# and the canvas matches, so nothing is ever upscaled.
+RENDER_W = 1920
 
 
 def creds() -> tuple[str, str]:
@@ -107,7 +124,8 @@ def png_size(path: Path) -> tuple[int, int]:
     return int(w), int(h)
 
 
-def render_ps_card(rows: list[str], overlay: str, dest: Path, width: int = 1600) -> None:
+def render_ps_card(rows: list[str], overlay: str, dest: Path,
+                   width: int = RENDER_W) -> None:
     """Draw the captured process table as a terminal-styled card."""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -124,6 +142,72 @@ def render_ps_card(rows: list[str], overlay: str, dest: Path, width: int = 1600)
         d.text((60, y), row, font=mono, fill=(126, 231, 135))
         y += 46
     img.save(dest)
+
+
+def render_vision_card(shots: list[tuple[str, Path]], overlay: str, dest: Path,
+                       width: int = RENDER_W, band_h: int = 860) -> None:
+    """Composite the screenshots the model actually saw, side by side.
+
+    These bytes reach the panes intact, but Textual's SVG export flattens
+    the image widget to a monochrome shade ramp — so the only way to show
+    the real view is to paste the original PNGs into their own frame.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    cjk = ImageFont.truetype("/System/Library/Fonts/STHeiti Medium.ttc", 30)
+    label = ImageFont.truetype("/System/Library/Fonts/STHeiti Medium.ttc", 24)
+    margin, gap, top = 60, 44, 132
+    avail = width - 2 * margin - gap * (len(shots) - 1)
+
+    thumbs = []
+    for name, path in shots:
+        im = Image.open(path).convert("RGB")
+        scale = band_h / im.height
+        thumbs.append((name, im.resize(
+            (max(1, round(im.width * scale)), band_h), Image.LANCZOS)))
+    # A landscape browser shot next to a portrait phone shot easily overflows;
+    # shrink the row as a whole so the relative sizes stay honest.
+    row_w = sum(t.width for _, t in thumbs)
+    if row_w > avail:
+        k = avail / row_w
+        thumbs = [(n, t.resize((max(1, round(t.width * k)),
+                                max(1, round(t.height * k))), Image.LANCZOS))
+                  for n, t in thumbs]
+        row_w = sum(t.width for _, t in thumbs)
+
+    row_h = max(t.height for _, t in thumbs)
+    img = Image.new("RGB", (width, top + row_h + 86), (13, 17, 23))
+    d = ImageDraw.Draw(img)
+    d.text((margin, 50), overlay, font=cjk, fill=(180, 220, 255))
+    x = margin + (avail - row_w) // 2
+    for name, t in thumbs:
+        img.paste(t, (x, top))
+        d.rectangle([x - 2, top - 2, x + t.width + 1, top + t.height + 1],
+                    outline=(70, 96, 118), width=2)
+        d.text((x, top + t.height + 18), name, font=label, fill=(126, 231, 135))
+        x += t.width + gap
+    img.save(dest)
+
+
+def vision_shots(session: Path, previews: dict[str, str]) -> list[tuple[str, Path]]:
+    """Resolve a frame's preview map to (label, path) pairs that exist on disk.
+
+    Ordered by PANE_LABELS so the layout matches the narration, which names
+    the browser first.
+    """
+    picked = []
+    for owner, rel in previews.items():
+        path = session / rel
+        if not path.exists():
+            continue
+        rank, label = len(PANE_LABELS), owner
+        for i, (prefix, text) in enumerate(PANE_LABELS):
+            if owner.lower().startswith(prefix):
+                rank, label = i, text
+                break
+        picked.append((rank, label, path))
+    picked.sort(key=lambda t: (t[0], t[2].name))
+    return [(label, path) for _, label, path in picked]
 
 
 def main() -> int:
@@ -146,17 +230,27 @@ def main() -> int:
     for d in (png_dir, audio_dir, seg_dir):
         d.mkdir(exist_ok=True)
 
-    # SVG -> PNG, then splice the ps evidence card in after both-running.
+    # SVG -> PNG, then splice the evidence cards in after both-running.
     shots: list[tuple[str, Path, str]] = []
     for f in frames:
         svg = session / f["svg"]
         png = png_dir / (svg.stem + ".png")
         if not png.exists():
-            subprocess.run(["rsvg-convert", "-w", "1600", "-f", "png",
+            subprocess.run(["rsvg-convert", "-w", str(RENDER_W), "-f", "png",
                             str(svg), "-o", str(png)], check=True)
         shots.append((f["slug"], png, f["say"]))
-        if f["slug"] == "both-running" and ps_rows:
-            # Only claim process isolation when we actually captured the table.
+        if f["slug"] != "both-running":
+            continue
+        # Only claim what this run actually captured.
+        seen = vision_shots(session, f.get("previews", {}))
+        if seen:
+            card = png_dir / "evidence-vision.png"
+            render_vision_card(seen, VISION_OVERLAY, card)
+            shots.append(("evidence-vision", card, VISION_SAY))
+            print(f"[mp4] vision card from {[p.name for _, p in seen]}")
+        else:
+            print("[mp4] WARNING: no real screenshots recorded -> vision card skipped")
+        if ps_rows:
             card = png_dir / "evidence-ps.png"
             render_ps_card(ps_rows, PS_OVERLAY, card)
             shots.append(("evidence-ps", card, PS_SAY))
@@ -167,7 +261,7 @@ def main() -> int:
     # The frames differ in aspect ratio (2-pane vs 9-pane grid vs the ps card),
     # so every segment must be letterboxed onto one identical canvas —
     # concat -c copy silently produces garbage on mismatched dimensions.
-    canvas_w = 1280
+    canvas_w = RENDER_W
     canvas_h = 2
     for _, png, _ in shots:
         w, h = png_size(png)

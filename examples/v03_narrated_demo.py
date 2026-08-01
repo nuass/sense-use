@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sense_use.config import ensure_config_exists, load_config
 from sense_use.tui.app import SenseUseApp
+from sense_use.tui.widgets.live_preview import LivePreview
 from sense_use.tui.widgets.target_pane import TargetPane
 from textual.widgets import Input
 
@@ -126,6 +127,42 @@ def worker_process_table() -> list[str]:
     return rows
 
 
+def install_shot_recorder(out: Path) -> dict[str, str]:
+    """Persist every observe frame a pane renders, keyed by pane title.
+
+    The in-pane preview is genuinely what the model saw, but Textual's SVG
+    export flattens the image widget to a monochrome shade ramp, so the
+    recorded frames cannot carry it. Keeping the original PNGs lets the
+    video composite the real thing instead of the rendered cell art.
+
+    Returns a live dict of pane -> newest relative path, so a caller can
+    read off whatever was on screen at the moment it took a snapshot.
+    """
+    shots_dir = out / "shots"
+    shots_dir.mkdir(exist_ok=True)
+    latest: dict[str, str] = {}
+    seen: dict[str, int] = {}
+    original = LivePreview.set_bytes
+
+    def patched(self, png_bytes, step=None):  # noqa: ANN001, ANN202
+        original(self, png_bytes, step=step)
+        if not png_bytes:
+            return
+        owner = "pane"
+        for anc in self.ancestors:
+            if isinstance(anc, TargetPane):
+                owner = (anc.title or "pane").split()[0] or "pane"
+                break
+        n = seen.get(owner, 0)
+        seen[owner] = n + 1
+        p = shots_dir / f"{owner}-{n:03d}.png"
+        p.write_bytes(png_bytes)
+        latest[owner] = f"shots/{p.name}"
+
+    LivePreview.set_bytes = patched
+    return latest
+
+
 async def main() -> int:
     out = (Path(os.path.expanduser("~/.sense-use/sessions/v03-narrated"))
            / time.strftime("%Y%m%d-%H%M%S"))
@@ -137,6 +174,7 @@ async def main() -> int:
     cfg.apply_voice_env()
 
     frames: list[dict] = []
+    latest_shots = install_shot_recorder(out)
 
     def shot(app: SenseUseApp, slug: str, overlay: str, say: str) -> None:
         """Snapshot one frame + the narration line that goes with it."""
@@ -144,7 +182,8 @@ async def main() -> int:
         svg = app.export_screenshot(title=overlay)
         p = out / f"snap-{idx:02d}-{slug}.svg"
         p.write_text(svg)
-        frames.append({"svg": p.name, "slug": slug, "overlay": overlay, "say": say})
+        frames.append({"svg": p.name, "slug": slug, "overlay": overlay,
+                       "say": say, "previews": dict(latest_shots)})
         print(f"[v03] {idx:02d} {slug:22s} say={say[:34]}...")
 
     # ---------- Act 1: two real tasks in parallel ----------
@@ -221,7 +260,9 @@ async def main() -> int:
     (out / "narration.json").write_text(
         json.dumps({"frames": frames, "ps_rows": ps_rows},
                    ensure_ascii=False, indent=2))
-    print(f"[v03] {len(frames)} frames + {len(ps_rows)} ps rows -> {out}/narration.json")
+    n_shots = len(list((out / "shots").glob("*.png")))
+    print(f"[v03] {len(frames)} frames + {len(ps_rows)} ps rows "
+          f"+ {n_shots} real screenshots -> {out}/narration.json")
     print(out)
     return 0
 
