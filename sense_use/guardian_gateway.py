@@ -87,10 +87,15 @@ _DESTRUCTIVE_ACTIONS = ("delete", "drop", "truncate")
 # A label matching this is worth a human's attention: money movement,
 # irreversible removal, or losing the session. Mirrors the union of the
 # per-backend patterns these rules were centralized from.
+#
+# The ASCII terms are word-bounded, the CJK ones deliberately are not (\b is
+# meaningless between CJK codepoints). Without the boundary, "wipe" matches
+# inside "swipe" and every Android swipe gesture escalates to a human —
+# which stalls the adb backend on its most common action.
 _SENSITIVE_LABEL = re.compile(
-    r"(pay|checkout|purchase|delete|remove|uninstall|wipe|logout|sign\s?out|"
-    r"confirm\s?order|transfer|"
-    r"支付|付款|转账|删除|卸载|注销|退出登录|确认下单|确认支付)",
+    r"\b(?:pay\w*|checkout|purchase\w*|delet\w*|remov\w*|uninstall\w*|wipe[sd]?|"
+    r"logout|log\s?out|sign\s?out|confirm\s+order|transfer\w*)\b"
+    r"|支付|付款|转账|删除|卸载|注销|退出登录|确认下单|确认支付",
     re.IGNORECASE,
 )
 
