@@ -76,6 +76,7 @@ class TargetPane(Widget):
         self._pump_task: asyncio.Task | None = None
         self._confirm_active = False
         self._log_buffer: list[str] = []
+        self._title_status: str = "idle"
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -164,6 +165,7 @@ class TargetPane(Widget):
                 self._log_buffer.append(plain)
 
     def _set_title_status(self, status: str) -> None:
+        self._title_status = status
         try:
             self.query_one("#pane-title", Static).update(
                 Text.from_markup(f"[b]{self.title}[/b] · [dim]{status}[/dim]")
